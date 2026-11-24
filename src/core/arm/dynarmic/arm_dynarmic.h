@@ -18,6 +18,8 @@ class MemorySystem;
 
 namespace Core {
 
+class NativeRunner;
+
 class DynarmicUserCallbacks;
 class DynarmicExclusiveMonitor;
 class ExclusiveMonitor;
@@ -67,6 +69,13 @@ private:
     void ServeBreak(int signal);
 
     friend class DynarmicUserCallbacks;
+    friend class NativeRunner;
+    void NativeSVC(u32 imm);
+    void NativeException(u32 pc, u32 kind);
+    std::unique_ptr<NativeRunner> native;
+    bool native_active = false;
+    bool native_slice = false;
+    bool halt_requested = false;
     Core::System& system;
     Memory::MemorySystem& memory;
     std::unique_ptr<DynarmicUserCallbacks> cb;

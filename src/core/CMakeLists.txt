@@ -545,12 +545,15 @@ if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)
         arm/dynarmic/arm_dynarmic.h
         arm/dynarmic/arm_dynarmic_cp15.cpp
         arm/dynarmic/arm_dynarmic_cp15.h
+        arm/dynarmic/arm_native.cpp
+        arm/dynarmic/arm_native.h
+        arm/dynarmic/ctr_abi.h
         arm/dynarmic/arm_exclusive_monitor.cpp
         arm/dynarmic/arm_exclusive_monitor.h
         arm/dynarmic/arm_tick_counts.cpp
         arm/dynarmic/arm_tick_counts.h
     )
-    target_link_libraries(citra_core PRIVATE dynarmic)
+    target_link_libraries(citra_core PRIVATE dynarmic ${CMAKE_DL_LIBS})
 endif()
 
 if (CITRA_USE_PRECOMPILED_HEADERS)

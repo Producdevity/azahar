@@ -33,6 +33,7 @@ public:
 
 private:
     friend class Core::ARM_Dynarmic;
+    friend class Core::NativeRunner;
     Dynarmic::ExclusiveMonitor monitor;
     Memory::MemorySystem& memory;
 };

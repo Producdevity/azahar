@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/optimization_flags.h>
@@ -20,6 +21,7 @@
 #endif
 #include "core/hle/kernel/svc.h"
 #include "core/memory.h"
+#include "core/arm/dynarmic/arm_native.h"
 
 #ifndef SIGILL
 constexpr u32 SIGILL = 4;
@@ -165,6 +167,9 @@ public:
     }
     std::uint64_t GetTicksRemaining() override {
         s64 ticks = parent.GetTimer().GetDowncount();
+        if (parent.native_slice) {
+            ticks = std::min<s64>(ticks, 2000);
+        }
         return static_cast<u64>(ticks <= 0 ? 0 : ticks);
     }
     std::uint64_t GetTicksForCode(bool is_thumb, VAddr, std::uint32_t instruction) override {
@@ -183,6 +188,9 @@ ARM_Dynarmic::ARM_Dynarmic(Core::System& system_, Memory::MemorySystem& memory_,
       cb(std::make_unique<DynarmicUserCallbacks>(*this)),
       exclusive_monitor{dynamic_cast<Core::DynarmicExclusiveMonitor&>(exclusive_monitor_)} {
     SetPageTable(memory.GetCurrentPageTable());
+    if (const char* m = std::getenv("AZAHAR_NATIVE_MODULE"); m && *m) {
+        native = std::make_unique<NativeRunner>(*this);
+    }
 }
 
 ARM_Dynarmic::~ARM_Dynarmic() = default;
@@ -196,7 +204,25 @@ void ARM_Dynarmic::Run() {
         return;
     }
 
+    if (native) {
+        native_active = true;
+        halt_requested = false;
+        const bool ran = native->Run();
+        native_active = false;
+        halt_requested = false;
+        if (ran) {
+            return;
+        }
+    }
     jit->Run();
+}
+
+void ARM_Dynarmic::NativeSVC(u32 imm) {
+    cb->CallSVC(imm);
+}
+
+void ARM_Dynarmic::NativeException(u32 pc, u32 kind) {
+    cb->ExceptionRaised(pc, static_cast<Dynarmic::A32::Exception>(kind));
 }
 
 void ARM_Dynarmic::Step() {
@@ -308,6 +334,10 @@ void ARM_Dynarmic::LoadContext(const ThreadContext& ctx) {
 }
 
 void ARM_Dynarmic::PrepareReschedule() {
+    if (native_active) {
+        halt_requested = true;
+        native->RequestExit();
+    }
     if (jit->IsExecuting()) {
         jit->HaltExecution();
     }
@@ -332,6 +362,9 @@ std::shared_ptr<Memory::PageTable> ARM_Dynarmic::GetPageTable() const {
 }
 
 void ARM_Dynarmic::SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
+    if (jit && current_page_table == page_table) {
+        return;
+    }
     current_page_table = page_table;
     ThreadContext ctx{};
     if (jit) {
