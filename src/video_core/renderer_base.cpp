@@ -2,9 +2,13 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
+#include "core/movie.h"
 #include "core/tracer/recorder.h"
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/renderer_base.h"
@@ -13,7 +17,11 @@ namespace VideoCore {
 
 RendererBase::RendererBase(Core::System& system_, Frontend::EmuWindow& window,
                            Frontend::EmuWindow* secondary_window_)
-    : system{system_}, render_window{window}, secondary_window{secondary_window_} {}
+    : system{system_}, render_window{window}, secondary_window{secondary_window_} {
+    if (std::getenv("AZAHAR_BENCH")) {
+        Settings::values.deterministic_async_operations = true;
+    }
+}
 
 RendererBase::~RendererBase() = default;
 
@@ -49,6 +57,30 @@ void RendererBase::EndFrame() {
 
 void RendererBase::FinishFrame() {
     finished_frames++;
+
+    static const bool bench = std::getenv("AZAHAR_BENCH") != nullptr;
+    if (bench && finished_frames % 300 == 0) {
+        static auto last_wall = std::chrono::steady_clock::now();
+        static timespec last_cpu{};
+        static u64 last_gpu_ns = 0;
+        timespec cpu{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu);
+        const auto wall = std::chrono::steady_clock::now();
+        const double wall_ms = std::chrono::duration<double, std::milli>(wall - last_wall).count();
+        const double cpu_ms = (cpu.tv_sec - last_cpu.tv_sec) * 1e3 + (cpu.tv_nsec - last_cpu.tv_nsec) / 1e6;
+        const u64 gpu_ns = gpu_thread_cpu_ns.load(std::memory_order_relaxed);
+        LOG_WARNING(Render, "BENCH frame={} wall_ms={:.1f} emu_cpu_ms={:.1f} gpu_cpu_ms={:.1f}",
+                    finished_frames, wall_ms, cpu_ms, (gpu_ns - last_gpu_ns) / 1e6);
+        last_wall = wall;
+        last_cpu = cpu;
+        last_gpu_ns = gpu_ns;
+    }
+    static const char* save_every = std::getenv("AZAHAR_BENCH_SAVE_EVERY");
+    if (save_every && finished_frames % std::strtoull(save_every, nullptr, 10) == 0 &&
+        system.Movie().GetPlayMode() == Core::Movie::PlayMode::Recording) {
+        system.Movie().SaveMovie();
+        LOG_WARNING(Render, "BENCH movie saved at frame {}", finished_frames);
+    }
 
     system.perf_stats->EndSystemFrame();
 
