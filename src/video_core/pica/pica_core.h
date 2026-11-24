@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <utility>
+#include <vector>
 #include "common/common_types.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/pica/dirty_regs.h"
@@ -115,6 +117,12 @@ public:
     ~PicaCore();
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+
+    /// Set by the GPU thread for a frame that is never shown: hardware-accelerated draws are
+    /// dropped and the render targets they would have written are listed instead.
+    bool skip_draws{};
+    std::vector<std::pair<PAddr, u32>> skipped_targets;
+    std::vector<PAddr> logged_fcram_targets;
 
     void SetInterruptHandler(Service::GSP::InterruptHandler& signal_interrupt);
 

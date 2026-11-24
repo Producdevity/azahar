@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <type_traits>
 #include <boost/container/small_vector.hpp>
 #include <boost/range/iterator_range.hpp>
@@ -1260,6 +1261,7 @@ void RasterizerCache<T>::ClearAll(bool flush) {
     // Remove the whole cache without really looking at it.
     cached_pages -= flush_interval;
     dirty_regions.clear();
+    memory.SetGpuDirtyPages(0, 0xFFFFFFFF, false);
     page_table.clear();
 }
 
@@ -1308,6 +1310,27 @@ void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surfa
 
     // Reset dirty regions
     dirty_regions -= flushed_intervals;
+    for (const auto& interval : flushed_intervals) {
+        RefreshGpuDirtyPages(interval.lower(), interval.upper());
+    }
+}
+
+template <class T>
+void RasterizerCache<T>::RefreshGpuDirtyPages(PAddr start, PAddr end) {
+    if (!memory.IsGpuDirtyTracking()) {
+        return;
+    }
+    start = std::max<PAddr>(start, Memory::VRAM_PADDR) & ~Memory::CITRA_PAGE_MASK;
+    end = std::min<PAddr>(end, Memory::FCRAM_N3DS_PADDR_END);
+    for (PAddr page = start; page < end; page += Memory::CITRA_PAGE_SIZE) {
+        if (!memory.IsGpuDirtyPage(page)) {
+            continue;
+        }
+        const SurfaceInterval page_interval(page, page + Memory::CITRA_PAGE_SIZE);
+        if (dirty_regions.find(page_interval) == dirty_regions.end()) {
+            memory.SetGpuDirtyPages(page, page + Memory::CITRA_PAGE_SIZE, false);
+        }
+    }
 }
 
 template <class T>
@@ -1353,8 +1376,10 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
 
     if (region_owner_id) {
         dirty_regions.set({invalid_interval, region_owner_id});
+        memory.SetGpuDirtyPages(addr, addr + size, true);
     } else {
         dirty_regions.erase(invalid_interval);
+        RefreshGpuDirtyPages(addr, addr + size);
     }
 
     for (const SurfaceId surface_id : remove_surfaces) {

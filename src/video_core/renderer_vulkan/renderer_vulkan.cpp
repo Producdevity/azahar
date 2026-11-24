@@ -1183,6 +1183,11 @@ void RendererVulkan::SwapBuffers() {
     EndFrame();
 }
 
+void RendererVulkan::SkipPresent() {
+    rasterizer.TickFrame();
+    EndFrame();
+}
+
 void RendererVulkan::RenderScreenshot() {
     if (!settings.screenshot_requested.exchange(false)) {
         return;

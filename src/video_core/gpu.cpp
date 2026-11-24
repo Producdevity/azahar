@@ -2,9 +2,16 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
+#include <string>
+#include <fmt/format.h>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
+#include "common/settings.h"
+#include "common/thread.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
@@ -83,6 +90,58 @@ public:
     }
 };
 
+namespace {
+constexpr std::size_t GPU_QUEUE_MAX_ITEMS = 1024;
+constexpr u64 GPU_MAX_SWAPS_IN_FLIGHT = 1;
+constexpr std::size_t GPU_MAX_DEFERRED_INVALIDATES = 256;
+constexpr u32 SKIP_STALE_PAGES =
+    (Memory::FCRAM_N3DS_PADDR_END - Memory::VRAM_PADDR) >> Memory::CITRA_PAGE_BITS;
+constexpr auto GPU_WAIT_LOG_FIRST = std::chrono::milliseconds(100);
+constexpr auto GPU_WAIT_LOG_REPEAT = std::chrono::milliseconds(1000);
+constexpr u64 GPU_STATS_EVERY_FRAMES = 600;
+
+constexpr std::array<const char*, GpuThreadState::NumReasons> WAIT_REASON_NAMES = {
+    "memory", "readreg", "idle", "dma", "other", "queue", "frame"};
+
+int GpuThreadMode() {
+    const char* value = std::getenv("AZAHAR_GPU_THREAD");
+    if (value == nullptr || value[0] < '1' || value[0] > '3') {
+        return 0;
+    }
+    return value[0] - '0';
+}
+
+u64 ThreadCpuNs() {
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<u64>(ts.tv_sec) * 1'000'000'000ull + static_cast<u64>(ts.tv_nsec);
+}
+
+template <typename Pred>
+void WaitLogged(std::unique_lock<std::mutex>& lock, GpuThreadState& state, u32 reason,
+                Pred pred) {
+    state.waits[reason]++;
+    if (pred()) {
+        return;
+    }
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    Clock::duration next_log = GPU_WAIT_LOG_FIRST;
+    while (!state.done_cv.wait_for(lock, std::chrono::milliseconds(20), pred)) {
+        const auto waited = Clock::now() - start;
+        if (waited >= next_log) {
+            LOG_WARNING(HW_GPU, "GPU thread: emu thread waiting {} ms for {} (queue={} running={})",
+                        std::chrono::duration_cast<std::chrono::milliseconds>(waited).count(),
+                        WAIT_REASON_NAMES[reason], state.queue.size(), state.current);
+            next_log = waited + GPU_WAIT_LOG_REPEAT;
+        }
+    }
+    state.blocked[reason]++;
+    state.blocked_ms[reason] +=
+        std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+} // Anonymous namespace
+
 MICROPROFILE_DEFINE(GPU_DisplayTransfer, "GPU", "DisplayTransfer", MP_RGB(100, 100, 255));
 MICROPROFILE_DEFINE(GPU_CmdlistProcessing, "GPU", "Cmdlist Processing", MP_RGB(100, 255, 100));
 
@@ -97,9 +156,470 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
 
     // Bind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
+
+    if (GpuThreadMode() != 0) {
+        if (Settings::GetWorkingGraphicsAPI() == Settings::GraphicsAPI::Vulkan) {
+            StartGpuThread();
+        } else {
+            LOG_WARNING(HW_GPU, "AZAHAR_GPU_THREAD ignored: only the Vulkan renderer is supported");
+        }
+    }
 }
 
-GPU::~GPU() = default;
+GPU::~GPU() {
+    StopGpuThread();
+}
+
+bool GPU::IsThreaded() const {
+    return impl->gpu_thread != nullptr;
+}
+
+void GPU::StartGpuThread() {
+    impl->gpu_thread = std::make_unique<GpuThreadState>();
+    auto& state = *impl->gpu_thread;
+    state.sync_each_slice = GpuThreadMode() == 2;
+    state.sync_on_idle = GpuThreadMode() != 3;
+    const char* skip_env = std::getenv("AZAHAR_SKIP_UNSHOWN");
+    state.skip_enabled = skip_env != nullptr && skip_env[0] == '1';
+    if (state.skip_enabled) {
+        state.skip_stale = std::make_unique<std::atomic<u8>[]>(SKIP_STALE_PAGES);
+        for (u32 i = 0; i < SKIP_STALE_PAGES; ++i) {
+            state.skip_stale[i].store(0, std::memory_order_relaxed);
+        }
+    }
+    impl->renderer->SetDeferredFrameEnd(true);
+    impl->memory.SetGpuDirtyTracking(true);
+    impl->memory.SetGpuThreadHooks(
+        [this](PAddr start, u32 size, Memory::FlushMode mode) {
+            return OnCpuAccess(start, size, mode);
+        },
+        [this](PAddr start, u32 size, bool cached) {
+            return DeferRasterizerMark(start, size, cached);
+        });
+    state.thread = std::thread([this] { GpuThreadLoop(); });
+    state.id = state.thread.get_id();
+    LOG_WARNING(HW_GPU,
+                "GPU thread started (mode {}, queue limit {}, swaps in flight {}, skip unshown {})",
+                GpuThreadMode(), GPU_QUEUE_MAX_ITEMS, GPU_MAX_SWAPS_IN_FLIGHT, state.skip_enabled);
+}
+
+void GPU::StopGpuThread() {
+    if (!impl->gpu_thread) {
+        return;
+    }
+    auto& state = *impl->gpu_thread;
+    FlushCpuInvalidates();
+    {
+        std::scoped_lock lock{state.mutex};
+        state.stop = true;
+    }
+    state.work_cv.notify_one();
+    state.thread.join();
+
+    // Every mark must reach the page tables exactly once, or a later unmark hits UNREACHABLE.
+    ApplyPendingMarks();
+    impl->memory.SetGpuThreadHooks({}, {});
+    impl->memory.SetGpuDirtyTracking(false);
+    if (impl->renderer) {
+        impl->renderer->SetDeferredFrameEnd(false);
+    }
+    const std::size_t dropped_irqs = state.irqs.size();
+    impl->gpu_thread.reset();
+    LOG_WARNING(HW_GPU, "GPU thread stopped (undelivered interrupts dropped: {})", dropped_irqs);
+}
+
+void GPU::GpuThreadLoop() {
+    Common::SetCurrentThreadName("GPU");
+    MicroProfileOnThreadCreate("GPU");
+    auto& state = *impl->gpu_thread;
+    std::unique_lock lock{state.mutex};
+    while (true) {
+        state.work_cv.wait(lock, [&] { return state.stop || !state.queue.empty(); });
+        if (state.queue.empty()) {
+            break;
+        }
+        GpuThreadState::Item item = std::move(state.queue.front());
+        state.queue.pop_front();
+        state.busy = true;
+        state.current = item.name;
+        lock.unlock();
+        state.done_cv.notify_all();
+
+        state.job_skipping = item.skip_candidate &&
+                             item.frame > state.skip_cancel_upto.load(std::memory_order_acquire) &&
+                             !state.skip_disabled.load(std::memory_order_relaxed);
+        state.job_skipped_any = false;
+        impl->pica.skip_draws = state.job_skipping;
+
+        const auto start = std::chrono::steady_clock::now();
+        item.fn();
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        if (elapsed >= GPU_WAIT_LOG_FIRST) {
+            LOG_WARNING(HW_GPU, "GPU thread: {} took {} ms", item.name,
+                        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+        }
+        item.fn = nullptr;
+
+        if (state.job_skipping) {
+            impl->pica.skip_draws = false;
+            for (const auto& [addr, size] : impl->pica.skipped_targets) {
+                MarkSkipStale(addr, size);
+            }
+            if (!impl->pica.skipped_targets.empty()) {
+                state.job_skipped_any = true;
+                impl->pica.skipped_targets.clear();
+            }
+            if (state.job_skipped_any) {
+                state.skipped_jobs.fetch_add(1, std::memory_order_relaxed);
+            }
+            state.job_skipping = false;
+        }
+
+        // Interrupts and cache marks become visible only once the whole job is done.
+        if (!state.job_irqs.empty() || !state.job_marks.empty()) {
+            std::scoped_lock completion_lock{state.completion_mutex};
+            state.irqs.insert(state.irqs.end(), state.job_irqs.begin(), state.job_irqs.end());
+            state.marks.insert(state.marks.end(), state.job_marks.begin(),
+                               state.job_marks.end());
+            state.has_completions.store(true, std::memory_order_release);
+        }
+        state.job_irqs.clear();
+        state.job_marks.clear();
+        state.completed_seq.store(item.seq, std::memory_order_release);
+
+        lock.lock();
+        state.busy = false;
+        state.current = "idle";
+        lock.unlock();
+        state.done_cv.notify_all();
+        lock.lock();
+    }
+#if MICROPROFILE_ENABLED
+    MicroProfileOnThreadExit();
+#endif
+}
+
+u64 GPU::PushGpuWork(const char* name, std::function<void()> fn) {
+    auto& state = *impl->gpu_thread;
+    if (std::this_thread::get_id() == state.id) {
+        fn();
+        return 0;
+    }
+    FlushCpuInvalidates();
+    return Enqueue(name, std::move(fn));
+}
+
+u64 GPU::Enqueue(const char* name, std::function<void()> fn) {
+    auto& state = *impl->gpu_thread;
+    const u64 seq = ++state.pushed_seq;
+    {
+        std::unique_lock lock{state.mutex};
+        WaitLogged(lock, state, GpuThreadState::QueueFull,
+                   [&] { return state.queue.size() < GPU_QUEUE_MAX_ITEMS; });
+        state.queue.push_back({name, seq, state.frame_id, state.frame_skip, std::move(fn)});
+    }
+    state.work_cv.notify_one();
+    return seq;
+}
+
+void GPU::FlushCpuInvalidates() {
+    auto& state = *impl->gpu_thread;
+    if (state.cpu_invalidates.empty()) {
+        return;
+    }
+    std::vector<std::pair<PAddr, u32>> ranges;
+    ranges.swap(state.cpu_invalidates);
+    Enqueue("CPU write invalidate", [this, ranges = std::move(ranges)] {
+        for (const auto& [addr, size] : ranges) {
+            impl->rasterizer->InvalidateRegion(addr, size);
+        }
+    });
+}
+
+bool GPU::MayHaveGpuWrites(PAddr start, u32 size) {
+    auto& state = *impl->gpu_thread;
+    const u64 completed = state.completed_seq.load(std::memory_order_acquire);
+    while (!state.pending_writes.empty() && state.pending_writes.front().seq <= completed) {
+        state.pending_writes.pop_front();
+    }
+    const PAddr end = start + size;
+    for (const auto& write : state.pending_writes) {
+        if (start < write.end && write.start < end) {
+            return true;
+        }
+    }
+    return impl->memory.AnyGpuDirtyPage(start, size);
+}
+
+bool GPU::OnCpuAccess(PAddr start, u32 size, Memory::FlushMode mode) {
+    auto& state = *impl->gpu_thread;
+    if (std::this_thread::get_id() == state.id) {
+        return false;
+    }
+    const bool reads = mode != Memory::FlushMode::Invalidate;
+    if ((state.skip_enabled && reads && AnySkipStale(start, size)) ||
+        mode == Memory::FlushMode::FlushAndInvalidate || MayHaveGpuWrites(start, size)) {
+        WaitIdle(GpuThreadState::Memory);
+        if (state.skip_enabled && reads && AnySkipStale(start, size)) {
+            // The CPU reads output of work that was already skipped; it cannot be recovered.
+            state.skip_violations.fetch_add(1, std::memory_order_relaxed);
+            if (!state.skip_disabled.exchange(true)) {
+                LOG_WARNING(HW_GPU,
+                            "Skip unshown frames: CPU read of skipped output at {:#010X}+{:#X}, "
+                            "skipping disabled",
+                            start, size);
+            }
+        }
+        return false;
+    }
+    // No completed or queued GPU write covers these pages, so memory is current: a read needs
+    // nothing, and a write only has to drop cached copies before later GPU work uses them.
+    if (mode == Memory::FlushMode::Flush) {
+        state.cpu_reads_skipped++;
+        return true;
+    }
+    state.cpu_writes_deferred++;
+    if (state.cpu_invalidates.empty() || state.cpu_invalidates.back() != std::pair{start, size}) {
+        state.cpu_invalidates.emplace_back(start, size);
+    }
+    if (state.cpu_invalidates.size() >= GPU_MAX_DEFERRED_INVALIDATES) {
+        FlushCpuInvalidates();
+    }
+    return true;
+}
+
+void GPU::NotePendingWrites(const Service::GSP::Command& command, u64 seq) {
+    using Service::GSP::CommandId;
+    auto& state = *impl->gpu_thread;
+    const auto add = [&](PAddr start, u64 size) {
+        if (size != 0) {
+            const u64 end = std::min<u64>(u64{start} + size, 0xFFFFFFFF);
+            state.pending_writes.push_back({start, static_cast<PAddr>(end), seq});
+        }
+    };
+    switch (command.id) {
+    case CommandId::MemoryFill: {
+        const auto& params = command.memory_fill;
+        const std::array<std::pair<u32, u32>, 2> fills{{{params.start1, params.end1},
+                                                        {params.start2, params.end2}}};
+        for (const auto& [start, end] : fills) {
+            if (start == 0) {
+                continue;
+            }
+            const PAddr phys_start = VirtualToPhysicalAddress(start);
+            const PAddr phys_end = VirtualToPhysicalAddress(end);
+            add(phys_start, phys_end > phys_start ? phys_end - phys_start + 16 : 16);
+        }
+        break;
+    }
+    case CommandId::DisplayTransfer: {
+        const auto& params = command.display_transfer;
+        const u64 width = params.out_buffer_size & 0xFFFF;
+        const u64 height = params.out_buffer_size >> 16;
+        // 4 bytes per pixel covers every output format.
+        add(VirtualToPhysicalAddress(params.out_buffer_address), width * height * 4);
+        break;
+    }
+    case CommandId::TextureCopy: {
+        const auto& params = command.texture_copy;
+        const u64 width = u64{params.out_width_gap & 0xFFFF} * 16;
+        const u64 gap = u64{params.out_width_gap >> 16} * 16;
+        const u64 span =
+            width == 0 ? params.size : (params.size + width - 1) / width * (width + gap);
+        add(VirtualToPhysicalAddress(params.out_buffer_address), span);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void GPU::WaitIdle() {
+    WaitIdle(GpuThreadState::Other);
+}
+
+void GPU::WaitIdle(u32 reason) {
+    if (!impl->gpu_thread) {
+        return;
+    }
+    auto& state = *impl->gpu_thread;
+    if (std::this_thread::get_id() == state.id) {
+        return;
+    }
+    if (reason != GpuThreadState::Idle) {
+        // The emulation thread needs GPU results now, so no queued work may be skipped.
+        CancelSkip();
+    }
+    FlushCpuInvalidates();
+    {
+        std::unique_lock lock{state.mutex};
+        WaitLogged(lock, state, reason, [&] { return state.queue.empty() && !state.busy; });
+    }
+    ApplyPendingMarks();
+}
+
+void GPU::CancelSkip() {
+    auto& state = *impl->gpu_thread;
+    if (!state.skip_enabled) {
+        return;
+    }
+    if (state.frame_skip) {
+        state.frame_skip = false;
+        state.skip_cancels++;
+    }
+    state.skip_cancel_upto.store(state.frame_id, std::memory_order_release);
+}
+
+bool GPU::SkipGpuOutput(PAddr in_start, u64 in_size, PAddr out_start, u64 out_size) {
+    if (!impl->gpu_thread || !impl->gpu_thread->job_skipping ||
+        std::this_thread::get_id() != impl->gpu_thread->id) {
+        return false;
+    }
+    // Only work that consumes rendered output is skipped; uploads from CPU-written memory run.
+    if (in_start < Memory::VRAM_PADDR || in_size == 0 ||
+        in_start + in_size > Memory::FCRAM_N3DS_PADDR_END) {
+        return false;
+    }
+    // Output in FCRAM may be read back by the CPU, so only VRAM destinations are skipped.
+    if (out_start < Memory::VRAM_PADDR || out_size == 0 ||
+        u64{out_start} + out_size > Memory::VRAM_PADDR_END) {
+        return false;
+    }
+    if (!impl->memory.AnyGpuDirtyPage(in_start, static_cast<u32>(in_size)) &&
+        !AnySkipStale(in_start, static_cast<u32>(in_size))) {
+        return false;
+    }
+    MarkSkipStale(out_start, out_size);
+    impl->gpu_thread->job_skipped_any = true;
+    return true;
+}
+
+void GPU::MarkSkipStale(PAddr start, u64 size) {
+    auto& state = *impl->gpu_thread;
+    const u64 begin = std::max<u64>(start, Memory::VRAM_PADDR);
+    const u64 end = std::min<u64>(u64{start} + size, Memory::FCRAM_N3DS_PADDR_END);
+    for (u64 page = begin & ~u64{Memory::CITRA_PAGE_MASK}; page < end;
+         page += Memory::CITRA_PAGE_SIZE) {
+        const u32 index = static_cast<u32>((page - Memory::VRAM_PADDR) >> Memory::CITRA_PAGE_BITS);
+        if (state.skip_stale[index].exchange(1, std::memory_order_release) == 0) {
+            state.stale_pages.push_back(index);
+        }
+    }
+}
+
+bool GPU::AnySkipStale(PAddr start, u32 size) const {
+    const auto& state = *impl->gpu_thread;
+    if (!state.skip_stale || size == 0) {
+        return false;
+    }
+    const u64 begin = std::max<u64>(start, Memory::VRAM_PADDR);
+    const u64 end = std::min<u64>(u64{start} + size, Memory::FCRAM_N3DS_PADDR_END);
+    for (u64 page = begin & ~u64{Memory::CITRA_PAGE_MASK}; page < end;
+         page += Memory::CITRA_PAGE_SIZE) {
+        const u32 index = static_cast<u32>((page - Memory::VRAM_PADDR) >> Memory::CITRA_PAGE_BITS);
+        if (state.skip_stale[index].load(std::memory_order_acquire) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void GPU::ClearSkipStale() {
+    auto& state = *impl->gpu_thread;
+    for (const u32 index : state.stale_pages) {
+        state.skip_stale[index].store(0, std::memory_order_release);
+    }
+    state.stale_pages.clear();
+}
+
+void GPU::RouteInterrupt(Service::GSP::InterruptId id, u64 delay_ns) {
+    if (impl->gpu_thread && std::this_thread::get_id() == impl->gpu_thread->id) {
+        impl->gpu_thread->job_irqs.emplace_back(id, delay_ns);
+        return;
+    }
+    // Keep GPU-thread interrupts ahead of the ones raised later on the emulation thread.
+    DeliverCompletions();
+    if (impl->emu_signal_interrupt) {
+        impl->emu_signal_interrupt(id, delay_ns);
+    }
+}
+
+bool GPU::DeferRasterizerMark(PAddr start, u32 size, bool cached) {
+    auto& state = *impl->gpu_thread;
+    if (std::this_thread::get_id() != state.id) {
+        // The caller applies its own mark right after; earlier GPU-thread marks go first.
+        ApplyPendingMarks();
+        return false;
+    }
+    state.job_marks.push_back({start, size, cached});
+    return true;
+}
+
+void GPU::ApplyPendingMarks() {
+    auto& state = *impl->gpu_thread;
+    if (!state.has_completions.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<GpuThreadState::Mark> marks;
+    {
+        std::scoped_lock lock{state.completion_mutex};
+        marks.swap(state.marks);
+        state.has_completions.store(!state.irqs.empty(), std::memory_order_relaxed);
+    }
+    for (const auto& mark : marks) {
+        impl->memory.ApplyRasterizerMark(mark.start, mark.size, mark.cached);
+    }
+}
+
+bool GPU::DeliverCompletions() {
+    if (!impl->gpu_thread) {
+        return false;
+    }
+    auto& state = *impl->gpu_thread;
+    if (!state.has_completions.load(std::memory_order_acquire) ||
+        std::this_thread::get_id() == state.id) {
+        return false;
+    }
+    std::vector<GpuThreadState::Mark> marks;
+    std::vector<std::pair<Service::GSP::InterruptId, u64>> irqs;
+    {
+        std::scoped_lock lock{state.completion_mutex};
+        marks.swap(state.marks);
+        irqs.swap(state.irqs);
+        state.has_completions.store(false, std::memory_order_relaxed);
+    }
+    // Marks first: the guest may touch the region as soon as it sees the interrupt.
+    for (const auto& mark : marks) {
+        impl->memory.ApplyRasterizerMark(mark.start, mark.size, mark.cached);
+    }
+    if (impl->emu_signal_interrupt) {
+        for (const auto& [id, delay_ns] : irqs) {
+            impl->emu_signal_interrupt(id, delay_ns);
+        }
+    }
+    return !irqs.empty();
+}
+
+void GPU::OnSliceStart() {
+    if (!impl->gpu_thread) {
+        return;
+    }
+    FlushCpuInvalidates();
+    if (impl->gpu_thread->sync_each_slice) {
+        WaitIdle(GpuThreadState::Idle);
+    }
+    DeliverCompletions();
+}
+
+bool GPU::SyncForIdle() {
+    if (!impl->gpu_thread) {
+        return false;
+    }
+    if (impl->gpu_thread->sync_on_idle) {
+        WaitIdle(GpuThreadState::Idle);
+    }
+    return DeliverCompletions();
+}
 
 PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
     if (addr == 0) {
@@ -126,23 +646,52 @@ PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
 }
 
 void GPU::SetInterruptHandler(Service::GSP::InterruptHandler handler) {
-    impl->signal_interrupt = handler;
-    impl->pica.SetInterruptHandler(handler);
+    if (!impl->gpu_thread) {
+        impl->signal_interrupt = handler;
+        impl->pica.SetInterruptHandler(handler);
+        return;
+    }
+    WaitIdle();
+    DeliverCompletions();
+    impl->emu_signal_interrupt = std::move(handler);
+    Service::GSP::InterruptHandler routed = [this](Service::GSP::InterruptId id, u64 delay_ns) {
+        RouteInterrupt(id, delay_ns);
+    };
+    impl->signal_interrupt = routed;
+    impl->pica.SetInterruptHandler(routed);
 }
 
 void GPU::FlushRegion(PAddr addr, u32 size) {
+    WaitIdle();
     impl->rasterizer->FlushRegion(addr, size);
 }
 
 void GPU::InvalidateRegion(PAddr addr, u32 size) {
+    WaitIdle();
     impl->rasterizer->InvalidateRegion(addr, size);
 }
 
 void GPU::ClearAll(bool flush) {
+    WaitIdle();
     impl->rasterizer->ClearAll(flush);
 }
 
 void GPU::Execute(const Service::GSP::Command& command) {
+    if (!impl->gpu_thread) {
+        ExecuteImpl(command);
+        return;
+    }
+    if (command.id == Service::GSP::CommandId::RequestDma) {
+        // DMA copies guest memory and signals on this thread, so the GPU must be done first.
+        WaitIdle(GpuThreadState::Dma);
+        ExecuteImpl(command);
+        return;
+    }
+    const u64 seq = PushGpuWork("GSP command", [this, command] { ExecuteImpl(command); });
+    NotePendingWrites(command, seq);
+}
+
+void GPU::ExecuteImpl(const Service::GSP::Command& command) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
 
@@ -257,6 +806,23 @@ void GPU::Execute(const Service::GSP::Command& command) {
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
+    if (impl->gpu_thread) {
+        PushGpuWork("SetBufferSwap",
+                    [this, screen_id, info] { SetBufferSwapImpl(screen_id, info); });
+    } else {
+        SetBufferSwapImpl(screen_id, info);
+    }
+
+    if (screen_id == 0) {
+        if (impl->gpu_thread) {
+            impl->gpu_thread->top_swap_this_frame = true;
+        }
+        MicroProfileFlip();
+        impl->system.perf_stats->EndGameFrame();
+    }
+}
+
+void GPU::SetBufferSwapImpl(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
     const PAddr phys_address_left = VirtualToPhysicalAddress(info.address_left);
     const PAddr phys_address_right = VirtualToPhysicalAddress(info.address_right);
 
@@ -280,18 +846,24 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
     }
 
     if (screen_id == 0) {
-        MicroProfileFlip();
-        impl->system.perf_stats->EndGameFrame();
         right_eye_disabler->ReportEndFrame();
     }
 }
 
 void GPU::SetColorFill(const Pica::ColorFill& fill) {
-    impl->pica.regs_lcd.color_fill_top = fill;
-    impl->pica.regs_lcd.color_fill_bottom = fill;
+    const auto apply = [this, fill] {
+        impl->pica.regs_lcd.color_fill_top = fill;
+        impl->pica.regs_lcd.color_fill_bottom = fill;
+    };
+    if (impl->gpu_thread) {
+        PushGpuWork("SetColorFill", apply);
+    } else {
+        apply();
+    }
 }
 
 u32 GPU::ReadReg(VAddr addr) {
+    WaitIdle(GpuThreadState::ReadReg);
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -314,6 +886,23 @@ u32 GPU::ReadReg(VAddr addr) {
 }
 
 void GPU::WriteReg(VAddr addr, u32 data) {
+    if (impl->gpu_thread) {
+        const u64 seq = PushGpuWork("WriteReg", [this, addr, data] { WriteRegImpl(addr, data); });
+        const u32 index = (addr - VADDR_GPU) / sizeof(u32);
+        const bool gpu_reg = (addr & 0xFFFFF000) == VADDR_GPU ||
+                             (addr & 0xFFFFF000) == VADDR_GPU + 0x1000;
+        if (gpu_reg && (index == GPU_REG_INDEX(memory_fill_config[0].trigger) ||
+                        index == GPU_REG_INDEX(memory_fill_config[1].trigger) ||
+                        index == GPU_REG_INDEX(display_transfer_config.trigger))) {
+            // The output range lives in GPU registers; treat all memory as written until done.
+            impl->gpu_thread->pending_writes.push_back({0, 0xFFFFFFFF, seq});
+        }
+        return;
+    }
+    WriteRegImpl(addr, data);
+}
+
+void GPU::WriteRegImpl(VAddr addr, u32 data) {
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -376,6 +965,7 @@ GraphicsDebugger& GPU::Debugger() {
 }
 
 void GPU::ApplyPerProgramSettings(u64 program_ID) {
+    WaitIdle();
     auto hack = Common::Hacks::hack_manager.GetHack(
         Common::Hacks::HackType::ACCURATE_MULTIPLICATION, program_ID);
     bool use_accurate_mul = Settings::values.shaders_accurate_mul.GetValue();
@@ -420,7 +1010,10 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
     }
 
     // Perform memory fill.
-    if (!impl->rasterizer->AccelerateFill(config)) {
+    const u64 fill_size = config.GetEndAddress() - config.GetStartAddress();
+    if (!SkipGpuOutput(config.GetStartAddress(), fill_size, config.GetStartAddress(),
+                       fill_size) &&
+        !impl->rasterizer->AccelerateFill(config)) {
         impl->sw_blitter->MemoryFill(config);
     }
 
@@ -462,7 +1055,15 @@ void GPU::MemoryTransfer() {
     u64 delay{};
     // Perform memory transfer
     if (config.is_texture_copy) {
-        if (!impl->rasterizer->AccelerateTextureCopy(config)) {
+        const u64 copy_size = config.texture_copy.size;
+        const u64 out_width = u64{config.texture_copy.output_width} * 16;
+        const u64 out_gap = u64{config.texture_copy.output_gap} * 16;
+        const u64 out_span =
+            out_width == 0 ? copy_size
+                           : (copy_size + out_width - 1) / out_width * (out_width + out_gap);
+        if (!SkipGpuOutput(config.GetPhysicalInputAddress(), copy_size,
+                           config.GetPhysicalOutputAddress(), out_span) &&
+            !impl->rasterizer->AccelerateTextureCopy(config)) {
             impl->sw_blitter->TextureCopy(config);
         }
         delay = DelayGenerator::CalculateDelayNanoseconds(
@@ -471,7 +1072,13 @@ void GPU::MemoryTransfer() {
     } else {
         if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
                                                            config.input_height)) {
-            if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
+            const u64 in_size = u64{config.input_width} * config.input_height *
+                                BytesPerPixel(config.input_format);
+            const u64 out_size = u64{config.output_width} * config.output_height *
+                                 BytesPerPixel(config.output_format);
+            if (!SkipGpuOutput(config.GetPhysicalInputAddress(), in_size,
+                               config.GetPhysicalOutputAddress(), out_size) &&
+                !impl->rasterizer->AccelerateDisplayTransfer(config)) {
                 impl->sw_blitter->DisplayTransfer(config);
             }
         }
@@ -490,14 +1097,73 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
 
-    // Present renderered frame.
-    impl->renderer->SwapBuffers();
+    if (impl->gpu_thread) {
+        auto& state = *impl->gpu_thread;
+        state.swaps_pushed++;
+        PushGpuWork("SwapBuffers", [this] {
+            auto& gpu_state = *impl->gpu_thread;
+            if (gpu_state.job_skipping) {
+                impl->renderer->SkipPresent();
+                gpu_state.skipped_frames.fetch_add(1, std::memory_order_relaxed);
+                gpu_state.job_skipped_any = true;
+            } else {
+                impl->renderer->SwapBuffers();
+                if (gpu_state.skip_stale) {
+                    ClearSkipStale();
+                }
+            }
+            impl->renderer->gpu_thread_cpu_ns.store(ThreadCpuNs(), std::memory_order_relaxed);
+            std::scoped_lock lock{impl->gpu_thread->mutex};
+            impl->gpu_thread->swaps_done++;
+        });
+        {
+            // Skip the next frame only after two frames that each swapped the top screen,
+            // and never two frames in a row.
+            const bool this_skipped =
+                state.frame_skip &&
+                state.frame_id > state.skip_cancel_upto.load(std::memory_order_relaxed);
+            const bool next_skip = state.skip_enabled &&
+                                   !state.skip_disabled.load(std::memory_order_relaxed) &&
+                                   !this_skipped && state.top_swap_this_frame &&
+                                   state.top_swap_prev_frame;
+            state.top_swap_prev_frame = state.top_swap_this_frame;
+            state.top_swap_this_frame = false;
+            state.frame_id++;
+            state.frame_skip = next_skip;
+        }
+        {
+            std::unique_lock lock{state.mutex};
+            WaitLogged(lock, state, GpuThreadState::Frame, [&] {
+                return state.swaps_pushed - state.swaps_done <= GPU_MAX_SWAPS_IN_FLIGHT;
+            });
+        }
+        if (state.swaps_pushed % GPU_STATS_EVERY_FRAMES == 0) {
+            std::string line;
+            for (u32 i = 0; i < GpuThreadState::NumReasons; ++i) {
+                line += fmt::format(" {}={}/{}/{:.0f}ms", WAIT_REASON_NAMES[i], state.waits[i],
+                                    state.blocked[i], state.blocked_ms[i]);
+            }
+            LOG_WARNING(HW_GPU,
+                        "GPU thread stats (calls/blocked/ms) frame={}:{} cpu_read_skip={} "
+                        "cpu_write_defer={} skipped_frames/jobs={}/{} skip_cancel={} "
+                        "skip_violation={}",
+                        state.swaps_pushed, line, state.cpu_reads_skipped,
+                        state.cpu_writes_deferred, state.skipped_frames.load(),
+                        state.skipped_jobs.load(), state.skip_cancels,
+                        state.skip_violations.load());
+        }
+        impl->renderer->FinishFrame();
+    } else {
+        // Present renderered frame.
+        impl->renderer->SwapBuffers();
+    }
 
     // Reschedule recurrent event
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
 }
 
 void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window) {
+    WaitIdle();
     // Reset the renderer (this will destroy OpenGL resources)
     impl->renderer.reset();
 
@@ -505,6 +1171,9 @@ void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow*
     impl->renderer =
         VideoCore::CreateRenderer(emu_window, secondary_window, impl->pica, impl->system);
     impl->rasterizer = impl->renderer->Rasterizer();
+    if (impl->memory.IsGpuDirtyTracking()) {
+        impl->memory.SetGpuDirtyPages(0, 0xFFFFFFFF, false);
+    }
 
     // Rebind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
@@ -537,6 +1206,7 @@ void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow*
 }
 
 void GPU::ReleaseRenderer() {
+    WaitIdle();
     // Just reset the renderer to release OpenGL resources
     // Don't null out rasterizer pointer as it will become dangling
     impl->renderer.reset();
@@ -546,6 +1216,7 @@ void GPU::ReleaseRenderer() {
 
 template <class Archive>
 void GPU::serialize(Archive& ar, const u32 file_version) {
+    WaitIdle();
     ar & impl->pica;
 }
 

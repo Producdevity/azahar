@@ -5,6 +5,7 @@
 #pragma once
 #include <array>
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <boost/serialization/array.hpp>
@@ -659,6 +660,30 @@ public:
      *               marked as cached or uncached.
      */
     void RasterizerMarkRegionCached(PAddr start, u32 size, bool cached);
+
+    /// Applies a cached-region change immediately, bypassing the GPU thread hook.
+    void ApplyRasterizerMark(PAddr start, u32 size, bool cached);
+
+    /**
+     * Installs hooks for a GPU thread that owns the rasterizer. cpu_access runs before every
+     * CPU-side rasterizer flush or invalidate of a physical range and returns true when it
+     * handled the access, in which case the rasterizer is not called here. defer_mark returns
+     * true when it queued a cached-region change for the emulation thread to apply.
+     * Empty functions remove them.
+     */
+    void SetGpuThreadHooks(std::function<bool(PAddr, u32, FlushMode)> cpu_access,
+                           std::function<bool(PAddr, u32, bool)> defer_mark);
+
+    /**
+     * Per-page record of where the rasterizer holds data newer than memory (VRAM to FCRAM end).
+     * Written by whichever thread currently owns the rasterizer cache, read by the emulation
+     * thread. Without tracking, and outside the tracked range, every page counts as dirty.
+     */
+    void SetGpuDirtyTracking(bool enabled);
+    bool IsGpuDirtyTracking() const;
+    void SetGpuDirtyPages(PAddr start, PAddr end, bool dirty);
+    bool IsGpuDirtyPage(PAddr addr) const;
+    bool AnyGpuDirtyPage(PAddr start, u32 size) const;
 
     /// For a rasterizer-accessible PAddr, gets a list of all possible VAddr
     std::vector<VAddr> PhysicalToVirtualAddressForRasterizer(PAddr addr);

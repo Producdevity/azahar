@@ -30,6 +30,10 @@ namespace Frontend {
 class EmuWindow;
 }
 
+namespace Memory {
+enum class FlushMode;
+}
+
 namespace VideoCore {
 
 /// Measured on hardware to be 2240568 timer cycles or 4481136 ARM11 cycles
@@ -99,7 +103,48 @@ public:
     /// Releases the renderer (for GL context destroy in libretro)
     void ReleaseRenderer();
 
+    /// Returns true when GPU work runs on a dedicated thread (AZAHAR_GPU_THREAD=1, Vulkan).
+    [[nodiscard]] bool IsThreaded() const;
+
+    /// Blocks until the GPU thread has finished all queued work, then applies its
+    /// cached-region changes. No-op without a GPU thread or when called on it.
+    void WaitIdle();
+
+    /// Applies cached-region changes and delivers interrupts produced by the GPU thread.
+    /// Must run on the emulation thread. Returns true if any interrupt was delivered.
+    bool DeliverCompletions();
+
+    /// Called when every CPU core is idle: drains the GPU thread so interrupts the guest waits
+    /// for arrive before emulated time skips ahead. Returns true if an interrupt was delivered.
+    bool SyncForIdle();
+
+    /// Called by the emulation thread at the start of every run loop slice.
+    void OnSliceStart();
+
 private:
+    void ExecuteImpl(const Service::GSP::Command& command);
+    void WriteRegImpl(VAddr addr, u32 data);
+    void SetBufferSwapImpl(u32 screen_id, const Service::GSP::FrameBufferInfo& info);
+
+    void StartGpuThread();
+    void StopGpuThread();
+    void GpuThreadLoop();
+    u64 PushGpuWork(const char* name, std::function<void()> fn);
+    u64 Enqueue(const char* name, std::function<void()> fn);
+    void WaitIdle(u32 reason);
+    bool OnCpuAccess(PAddr start, u32 size, Memory::FlushMode mode);
+    bool MayHaveGpuWrites(PAddr start, u32 size);
+    void FlushCpuInvalidates();
+    void NotePendingWrites(const Service::GSP::Command& command, u64 seq);
+    void RouteInterrupt(Service::GSP::InterruptId id, u64 delay_ns);
+    bool DeferRasterizerMark(PAddr start, u32 size, bool cached);
+    void ApplyPendingMarks();
+    void CancelSkip();
+    bool SkipGpuOutput(PAddr in_start, u64 in_size, PAddr out_start, u64 out_size);
+    void MarkSkipStale(PAddr start, u64 size);
+    bool AnySkipStale(PAddr start, u32 size) const;
+    void ClearSkipStale();
+
     void SubmitCmdList(u32 index);
 
     // Interrupt index must be 0 or 1 to signal the relative PSC interrupt.

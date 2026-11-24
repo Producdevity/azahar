@@ -771,6 +771,7 @@ static void CopyFrameBuffer(Core::System& system, VAddr dst, VAddr src, u32 dst_
 }
 
 static void ClearFramebuffer(Core::System& system, VAddr dst, u32 dst_stride, u32 lines) {
+    system.GPU().WaitIdle();
     auto* dst_ptr = system.Memory().GetPointer(dst);
 
     if (!dst_ptr) {
@@ -932,6 +933,7 @@ Result GSP_GPU::AcquireGpuRight(const Kernel::HLERequestContext& ctx,
             Common::Hacks::HackAllowMode::DISALLOW) != Common::Hacks::HackAllowMode::DISALLOW;
 
     auto& gpu = system.GPU();
+    gpu.WaitIdle();
     gpu.ApplyPerProgramSettings(process->codeset->program_id);
     gpu.GetRightEyeDisabler().SetEnabled(right_eye_disable_allow);
     gpu.PicaCore().vs_setup.SetRequiresShaderFixup(requires_shader_fixup);
@@ -1200,6 +1202,7 @@ void VramBackupHandler::RestoreVRAMBank(size_t bank_id) {
 
     VAddr bank_vaddr = Memory::VRAM_VADDR + bank_id * VRAM_BACKUP_BANK_SIZE;
 
+    system.GPU().WaitIdle();
     u8* data = system.Memory().GetPointer(bank_vaddr);
     memcpy(data, vram_backup[bank_id].data(), VRAM_BACKUP_BANK_SIZE);
 

@@ -139,6 +139,9 @@ public:
     void ClearAll(bool flush);
 
 private:
+    /// Clears the GPU-dirty mark of pages in [start, end) that no longer hold dirty regions.
+    void RefreshGpuDirtyPages(PAddr start, PAddr end);
+
     /// Iterate over all page indices in a range
     template <typename Func>
     void ForEachPage(PAddr addr, std::size_t size, Func&& func) {

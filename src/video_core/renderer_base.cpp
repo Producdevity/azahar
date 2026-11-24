@@ -42,6 +42,13 @@ void RendererBase::UpdateCurrentFramebufferLayout(bool is_portrait_mode) {
 
 void RendererBase::EndFrame() {
     current_frame++;
+    if (!defer_frame_end) {
+        FinishFrame();
+    }
+}
+
+void RendererBase::FinishFrame() {
+    finished_frames++;
 
     system.perf_stats->EndSystemFrame();
 

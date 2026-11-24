@@ -126,6 +126,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
 #endif
 
     ProcessPendingWork();
+    gpu->OnSliceStart();
 
     Signal signal{Signal::None};
     u32 param{};
@@ -192,6 +193,8 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         !kernel->AreAsyncOperationsPending()) {
         const u32 slot = save_state_slot;
         save_state_request_status = SaveStateStatus::NONE;
+        gpu->WaitIdle();
+        gpu->DeliverCompletions();
         LOG_INFO(Core, "Begin load of slot {}", slot);
         try {
             System::LoadState(slot);
@@ -207,6 +210,8 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                !kernel->AreAsyncOperationsPending()) {
         save_state_request_status = SaveStateStatus::NONE;
         const u32 slot = save_state_slot;
+        gpu->WaitIdle();
+        gpu->DeliverCompletions();
         LOG_INFO(Core, "Begin save to slot {}", slot);
         try {
             System::SaveState(slot);
@@ -282,6 +287,25 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             cpu_core->PrepareReschedule();
             kernel->GetThreadManager(cpu_core->GetID()).Reschedule();
             max_slice = std::min(max_slice, cpu_core->GetTimer().GetMaxSliceLength());
+        }
+        if (gpu->IsThreaded()) {
+            // With every core idle the slice would skip emulated time; finish GPU work first so
+            // a thread waiting for a GPU interrupt runs instead.
+            bool all_idle = true;
+            for (const auto& cpu_core : cpu_cores) {
+                if (kernel->GetThreadManager(cpu_core->GetID()).GetCurrentThread() != nullptr) {
+                    all_idle = false;
+                    break;
+                }
+            }
+            if (all_idle && gpu->SyncForIdle()) {
+                for (const auto& cpu_core : cpu_cores) {
+                    running_core = cpu_core.get();
+                    kernel->SetRunningCPU(running_core);
+                    cpu_core->PrepareReschedule();
+                    kernel->GetThreadManager(cpu_core->GetID()).Reschedule();
+                }
+            }
         }
         for (auto& cpu_core : cpu_cores) {
             cpu_core->GetTimer().SetNextSlice(max_slice);

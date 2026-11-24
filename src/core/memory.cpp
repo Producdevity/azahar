@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <array>
+#include <atomic>
 #include <csignal>
 #include <cstring>
 #include <boost/serialization/array.hpp>
@@ -118,6 +119,10 @@ public:
     std::shared_ptr<BackingMem> dsp_mem;
 
     PAddr plugin_fb_address{};
+
+    std::function<bool(PAddr, u32, FlushMode)> gpu_cpu_access;
+    std::function<bool(PAddr, u32, bool)> gpu_defer_mark;
+    std::unique_ptr<std::atomic<u8>[]> gpu_dirty_pages;
 
     Impl(Core::System& system_);
 
@@ -320,6 +325,10 @@ public:
             VAddr overlap_end = std::min(end, region_end);
             PAddr physical_start = paddr_region_start + (overlap_start - region_start);
             u32 overlap_size = overlap_end - overlap_start;
+
+            if (gpu_cpu_access && gpu_cpu_access(physical_start, overlap_size, mode)) {
+                return;
+            }
 
             auto* rasterizer = renderer.Rasterizer();
             switch (mode) {
@@ -984,7 +993,83 @@ std::vector<VAddr> MemorySystem::PhysicalToVirtualAddressForRasterizer(PAddr add
     return {};
 }
 
+void MemorySystem::SetGpuThreadHooks(std::function<bool(PAddr, u32, FlushMode)> cpu_access,
+                                     std::function<bool(PAddr, u32, bool)> defer_mark) {
+    impl->gpu_cpu_access = std::move(cpu_access);
+    impl->gpu_defer_mark = std::move(defer_mark);
+}
+
+namespace {
+constexpr PAddr GPU_DIRTY_BEGIN = VRAM_PADDR;
+constexpr PAddr GPU_DIRTY_END = FCRAM_N3DS_PADDR_END;
+constexpr u32 GPU_DIRTY_PAGES = (GPU_DIRTY_END - GPU_DIRTY_BEGIN) >> CITRA_PAGE_BITS;
+} // namespace
+
+void MemorySystem::SetGpuDirtyTracking(bool enabled) {
+    if (!enabled) {
+        impl->gpu_dirty_pages.reset();
+        return;
+    }
+    impl->gpu_dirty_pages = std::make_unique<std::atomic<u8>[]>(GPU_DIRTY_PAGES);
+    for (u32 i = 0; i < GPU_DIRTY_PAGES; ++i) {
+        impl->gpu_dirty_pages[i].store(0, std::memory_order_relaxed);
+    }
+}
+
+bool MemorySystem::IsGpuDirtyTracking() const {
+    return impl->gpu_dirty_pages != nullptr;
+}
+
+void MemorySystem::SetGpuDirtyPages(PAddr start, PAddr end, bool dirty) {
+    if (!impl->gpu_dirty_pages) {
+        return;
+    }
+    start = std::max(start, GPU_DIRTY_BEGIN);
+    end = std::min(end, GPU_DIRTY_END);
+    if (start >= end) {
+        return;
+    }
+    const u32 first = (start - GPU_DIRTY_BEGIN) >> CITRA_PAGE_BITS;
+    const u32 last = (end - 1 - GPU_DIRTY_BEGIN) >> CITRA_PAGE_BITS;
+    for (u32 i = first; i <= last; ++i) {
+        impl->gpu_dirty_pages[i].store(dirty ? 1 : 0, std::memory_order_release);
+    }
+}
+
+bool MemorySystem::IsGpuDirtyPage(PAddr addr) const {
+    if (!impl->gpu_dirty_pages || addr < GPU_DIRTY_BEGIN || addr >= GPU_DIRTY_END) {
+        return true;
+    }
+    return impl->gpu_dirty_pages[(addr - GPU_DIRTY_BEGIN) >> CITRA_PAGE_BITS].load(
+               std::memory_order_acquire) != 0;
+}
+
+bool MemorySystem::AnyGpuDirtyPage(PAddr start, u32 size) const {
+    if (!impl->gpu_dirty_pages || size == 0) {
+        return true;
+    }
+    const PAddr end = start + size;
+    if (start < GPU_DIRTY_BEGIN || end > GPU_DIRTY_END || end < start) {
+        return true;
+    }
+    const u32 first = (start - GPU_DIRTY_BEGIN) >> CITRA_PAGE_BITS;
+    const u32 last = (end - 1 - GPU_DIRTY_BEGIN) >> CITRA_PAGE_BITS;
+    for (u32 i = first; i <= last; ++i) {
+        if (impl->gpu_dirty_pages[i].load(std::memory_order_acquire) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached) {
+    if (impl->gpu_defer_mark && impl->gpu_defer_mark(start, size, cached)) {
+        return;
+    }
+    ApplyRasterizerMark(start, size, cached);
+}
+
+void MemorySystem::ApplyRasterizerMark(PAddr start, u32 size, bool cached) {
     if (start == 0) {
         return;
     }

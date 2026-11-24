@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
+#include <array>
 #include "common/arch.h"
 #include "common/archives.h"
 #include "common/microprofile.h"
@@ -1077,6 +1079,46 @@ void PicaCore::DrawArrays(bool is_indexed) {
     // Add vertices to the delay generator.
     delay_generator.AddVertices(regs.internal.pipeline.num_vertices,
                                 regs.internal.pipeline.triangle_topology);
+
+    if (skip_draws && accelerate_draw) {
+        const auto& fb = regs.internal.framebuffer.framebuffer;
+        // 4 bytes per pixel bounds every color and depth format.
+        const u32 size = fb.GetWidth() * fb.GetHeight() * 4;
+        const std::array<std::pair<PAddr, u32>, 2> targets{{
+            {fb.GetColorBufferPhysicalAddress(), size},
+            {fb.GetDepthBufferPhysicalAddress(), size},
+        }};
+        // Only targets in VRAM are skipped; the CPU may read back targets in FCRAM.
+        bool in_vram = true;
+        for (const auto& [addr, bytes] : targets) {
+            if (addr == 0 || (addr >= Memory::VRAM_PADDR &&
+                              u64{addr} + bytes <= Memory::VRAM_PADDR_END)) {
+                continue;
+            }
+            in_vram = false;
+            if (logged_fcram_targets.size() < 16 &&
+                std::find(logged_fcram_targets.begin(), logged_fcram_targets.end(), addr) ==
+                    logged_fcram_targets.end()) {
+                logged_fcram_targets.push_back(addr);
+                LOG_WARNING(HW_GPU,
+                            "Skip unshown frames: draw into non-VRAM target {:#010X} ({}x{}, "
+                            "color={:#010X} depth={:#010X}) runs",
+                            addr, fb.GetWidth(), fb.GetHeight(),
+                            fb.GetColorBufferPhysicalAddress(),
+                            fb.GetDepthBufferPhysicalAddress());
+            }
+        }
+        if (in_vram) {
+            for (const auto& target : targets) {
+                if (target.first != 0 &&
+                    std::find(skipped_targets.begin(), skipped_targets.end(), target) ==
+                        skipped_targets.end()) {
+                    skipped_targets.push_back(target);
+                }
+            }
+            return;
+        }
+    }
 
     // Attempt to use hardware vertex shaders if possible.
     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {

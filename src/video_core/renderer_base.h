@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "common/common_types.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "video_core/rasterizer_interface.h"
@@ -47,6 +48,11 @@ public:
     /// Finalize rendering the guest frame and draw into the presentation texture
     virtual void SwapBuffers() = 0;
 
+    /// Ends a frame that is not shown: no presentation, only per-frame bookkeeping.
+    virtual void SkipPresent() {
+        EndFrame();
+    }
+
     /// Draws the latest frame to the window waiting timeout_ms for a frame to arrive (Renderer
     /// specific implementation)
     virtual void TryPresent(int timeout_ms, bool is_secondary) = 0;
@@ -76,6 +82,17 @@ public:
 
     /// Ends the current frame
     void EndFrame();
+
+    /// Frame-end work that belongs to the emulation thread: perf stats, events, frame limiting.
+    void FinishFrame();
+
+    /// When set, EndFrame leaves FinishFrame to the caller (used by the GPU thread).
+    void SetDeferredFrameEnd(bool deferred) {
+        defer_frame_end = deferred;
+    }
+
+    /// CPU time of the GPU thread, published after each swap for benchmark logging.
+    std::atomic<u64> gpu_thread_cpu_ns{0};
 
     f32 GetCurrentFPS() const {
         return current_fps;
@@ -117,6 +134,10 @@ protected:
 protected:
     f32 current_fps = 0.0f; /// Current framerate, should be set by the renderer
     u64 current_frame = 0;  /// Current frame, should be set by the renderer
+
+private:
+    bool defer_frame_end = false;
+    u64 finished_frames = 0;
 };
 
 } // namespace VideoCore
