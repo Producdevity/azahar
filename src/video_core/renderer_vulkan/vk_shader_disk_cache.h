@@ -357,6 +357,8 @@ private:
     tsl::robin_map<u64, std::unique_ptr<GraphicsPipeline>, Common::IdentityHash<u64>>
         graphics_pipelines;
     std::unordered_set<u64> known_graphic_pipelines;
+    StaticPipelineInfo last_pipeline_state{};
+    GraphicsPipeline* last_pipeline{};
 };
 
 } // namespace Vulkan

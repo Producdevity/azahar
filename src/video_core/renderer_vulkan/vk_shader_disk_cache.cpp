@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstring>
 #include "common/common_paths.h"
 #include "common/file_util.h"
 #include "common/scm_rev.h"
@@ -236,6 +237,10 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFixedGeometrySh
 }
 
 GraphicsPipeline* ShaderDiskCache::GetPipeline(const PipelineInfo& info) {
+    if (last_pipeline &&
+        std::memcmp(&last_pipeline_state, &info.state, sizeof(StaticPipelineInfo)) == 0) {
+        return last_pipeline;
+    }
 
     u64 hash = info.Hash();
     u64 optimized_hash = info.state.OptimizedHash(parent.instance);
@@ -255,7 +260,7 @@ GraphicsPipeline* ShaderDiskCache::GetPipeline(const PipelineInfo& info) {
             *parent.pipeline_layout, parent.current_shaders, &parent.pipeline_workers);
     }
 
-    if (known_graphic_pipelines.emplace(hash).second) {
+    if (!known_graphic_pipelines.contains(hash) && known_graphic_pipelines.emplace(hash).second) {
         LOG_NEW_OBJECT(Render_Vulkan, "New Pipeline {:016X}", hash);
 
         PLConfigEntry entry{
@@ -266,7 +271,9 @@ GraphicsPipeline* ShaderDiskCache::GetPipeline(const PipelineInfo& info) {
         AppendPLConfig(pl_cache, entry, hash);
     }
 
-    return it.value().get();
+    last_pipeline_state = info.state;
+    last_pipeline = it.value().get();
+    return last_pipeline;
 }
 
 ShaderDiskCache::SourceFileCacheVersionHash ShaderDiskCache::GetSourceFileCacheVersionHash() {
@@ -1327,7 +1334,10 @@ bool ShaderDiskCache::InitGSCache(const std::atomic_bool& stop_loading,
 bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
                                   const VideoCore::DiskResourceLoadCallback& callback) {
 
-    auto cleanup_on_error = [&]() { graphics_pipelines.clear(); };
+    auto cleanup_on_error = [&]() {
+        graphics_pipelines.clear();
+        last_pipeline = nullptr;
+    };
 
     LOG_INFO(Render_Vulkan, "Loading PL disk shader cache for title {:016X}", title_id);
 
