@@ -7,9 +7,14 @@
 extern "C" {
 #endif
 
-#define CTR_ABI_VERSION 1
+#define CTR_ABI_VERSION 3
 
 typedef struct CtrState CtrState;
+/* One recompiled function. On entry s->r[15] (| thumb in cpsr.T) is the
+ * function start or one of its resume points. It returns when the guest
+ * returns from it, on an exit, or when control leaves code it covers; in all
+ * cases s->r[15] and s->cpsr.T describe the next guest instruction. */
+typedef void (*CtrFunction)(CtrState* s);
 
 typedef struct CtrCallbacks {
     /* slow paths: page_table entry NULL, or an access crossing a page */
@@ -39,12 +44,16 @@ typedef struct CtrCallbacks {
     /* coprocessor 15 beyond the c13 thread registers and barriers */
     uint32_t (*cp15_read)(CtrState* s, uint32_t opc1, uint32_t crn, uint32_t crm, uint32_t opc2);
     void (*cp15_write)(CtrState* s, uint32_t opc1, uint32_t crn, uint32_t crm, uint32_t opc2, uint32_t v);
+    /* function holding the entry for guest address | 1 for Thumb, NULL when the module has none */
+    CtrFunction (*lookup)(CtrState* s, uint32_t addr_thumb);
 } CtrCallbacks;
 
 struct CtrState {
     uint32_t r[16];        /* r[15]: guest pc of the next instruction on every exit */
     uint32_t cpsr;         /* complete CPSR: NZCVQ, GE, T, E, mode */
-    uint32_t fpscr;        /* complete FPSCR incl. NZCV, length/stride, mode bits */
+    uint32_t fpscr;        /* FPSCR incl. NZCV, length/stride, mode bits; the cumulative exception
+                              bits (0x9F) also collect in the host FPSR while native code runs, and
+                              the host folds them in (and clears FPSR) when it takes the state */
     uint32_t ext[64];      /* VFP registers as dynarmic ExtRegs: S0..S31 overlay D0..D15, D16..D31 */
     int64_t ticks;         /* remaining budget; code subtracts and leaves when <= 0 */
     uint32_t exit;         /* nonzero: unwind every native frame back to the dispatcher */
@@ -55,11 +64,6 @@ struct CtrState {
     void* user;
 };
 
-/* One recompiled function. On entry s->r[15] (| thumb in cpsr.T) is the
- * function start or one of its resume points. It returns when the guest
- * returns from it, on an exit, or when control leaves code it covers; in all
- * cases s->r[15] and s->cpsr.T describe the next guest instruction. */
-typedef void (*CtrFunction)(CtrState* s);
 
 typedef struct CtrEntry {
     uint32_t addr;         /* guest address | 1 for Thumb */
