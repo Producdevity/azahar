@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <clocale>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -2725,7 +2726,9 @@ void GMainWindow::ShowFullscreen() {
     if (ui->action_Single_Window_Mode->isChecked()) {
         UISettings::values.geometry = saveGeometry();
         ui->menubar->hide();
-        statusBar()->hide();
+        // Handheld test runs keep speed and FPS on screen; the bar sits in the letterbox.
+        statusBar()->setVisible(std::getenv("AZAHAR_FULLSCREEN_STATUS") != nullptr &&
+                                ui->action_Show_Status_Bar->isChecked());
 #ifdef NEEDS_ROUND_CORNERS_FIX
         WindowCornerManager::instance().blockRoundedCorners(this, true);
 #endif
