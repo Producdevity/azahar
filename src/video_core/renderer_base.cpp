@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -12,6 +13,11 @@
 #include "core/tracer/recorder.h"
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/renderer_base.h"
+
+namespace Memory {
+extern std::atomic<u64> bench_cached_reads;
+extern std::atomic<u64> bench_cached_writes;
+} // namespace Memory
 
 namespace VideoCore {
 
@@ -69,8 +75,16 @@ void RendererBase::FinishFrame() {
         const double wall_ms = std::chrono::duration<double, std::milli>(wall - last_wall).count();
         const double cpu_ms = (cpu.tv_sec - last_cpu.tv_sec) * 1e3 + (cpu.tv_nsec - last_cpu.tv_nsec) / 1e6;
         const u64 gpu_ns = gpu_thread_cpu_ns.load(std::memory_order_relaxed);
-        LOG_WARNING(Render, "BENCH frame={} wall_ms={:.1f} emu_cpu_ms={:.1f} gpu_cpu_ms={:.1f}",
-                    finished_frames, wall_ms, cpu_ms, (gpu_ns - last_gpu_ns) / 1e6);
+        static u64 last_reads = 0, last_writes = 0;
+        const u64 reads = Memory::bench_cached_reads.load(std::memory_order_relaxed);
+        const u64 writes = Memory::bench_cached_writes.load(std::memory_order_relaxed);
+        LOG_WARNING(Render,
+                    "BENCH frame={} wall_ms={:.1f} emu_cpu_ms={:.1f} gpu_cpu_ms={:.1f} "
+                    "cached_reads={} cached_writes={}",
+                    finished_frames, wall_ms, cpu_ms, (gpu_ns - last_gpu_ns) / 1e6,
+                    reads - last_reads, writes - last_writes);
+        last_reads = reads;
+        last_writes = writes;
         last_wall = wall;
         last_cpu = cpu;
         last_gpu_ns = gpu_ns;

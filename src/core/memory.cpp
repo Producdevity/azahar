@@ -45,6 +45,9 @@ constexpr u32 SIGSEGV = 11;
 
 namespace Memory {
 
+std::atomic<u64> bench_cached_reads{0};
+std::atomic<u64> bench_cached_writes{0};
+
 void PageTable::Clear() {
     pointers.raw.fill(nullptr);
     pointers.refs.fill(MemoryRef());
@@ -661,6 +664,7 @@ T MemorySystem::Read(const std::shared_ptr<PageTable>& page_table, const VAddr v
     }
     [[likely]] case PageType::RasterizerCachedMemory: {
         RasterizerFlushVirtualRegion(vaddr, read_size, FlushMode::Flush);
+        bench_cached_reads.fetch_add(1, std::memory_order_relaxed);
 
         ReadType value;
         std::memcpy(&value, GetPointerForRasterizerCache(vaddr), read_size);
@@ -749,6 +753,7 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
     }
     [[likely]] case PageType::RasterizerCachedMemory: {
         RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
+        bench_cached_writes.fetch_add(1, std::memory_order_relaxed);
         std::memcpy(GetPointerForRasterizerCache(vaddr), &data, sizeof(T));
         break;
     }
@@ -807,6 +812,7 @@ bool MemorySystem::WriteExclusive(const VAddr vaddr, const T data, const T expec
     }
     [[likely]] case PageType::RasterizerCachedMemory: {
         RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
+        bench_cached_writes.fetch_add(1, std::memory_order_relaxed);
         const auto volatile_pointer =
             reinterpret_cast<volatile T*>(GetPointerForRasterizerCache(vaddr).GetPtr());
         return Common::AtomicCompareAndSwap(volatile_pointer, data, expected);

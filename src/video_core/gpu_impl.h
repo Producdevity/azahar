@@ -89,6 +89,9 @@ struct GpuThreadState {
     std::array<u64, NumReasons> blocked{};
     std::array<double, NumReasons> blocked_ms{};
 
+    // AZAHAR_GPU_STRESS_US=N: random delay before each job, to widen races in testing.
+    u32 stress_us{};
+
     // AZAHAR_SKIP_UNSHOWN=1, emulation thread only.
     bool skip_enabled{};
     u64 frame_id{1};

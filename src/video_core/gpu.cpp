@@ -181,6 +181,9 @@ void GPU::StartGpuThread() {
     state.sync_on_idle = GpuThreadMode() != 3;
     const char* skip_env = std::getenv("AZAHAR_SKIP_UNSHOWN");
     state.skip_enabled = skip_env != nullptr && skip_env[0] == '1';
+    if (const char* stress_env = std::getenv("AZAHAR_GPU_STRESS_US")) {
+        state.stress_us = static_cast<u32>(std::strtoul(stress_env, nullptr, 10));
+    }
     if (state.skip_enabled) {
         state.skip_stale = std::make_unique<std::atomic<u8>[]>(SKIP_STALE_PAGES);
         for (u32 i = 0; i < SKIP_STALE_PAGES; ++i) {
@@ -251,6 +254,9 @@ void GPU::GpuThreadLoop() {
         state.job_skipped_any = false;
         impl->pica.skip_draws = state.job_skipping;
 
+        if (state.stress_us != 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(std::rand() % state.stress_us));
+        }
         const auto start = std::chrono::steady_clock::now();
         item.fn();
         const auto elapsed = std::chrono::steady_clock::now() - start;
