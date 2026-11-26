@@ -3,7 +3,9 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
+#include <thread>
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/settings.h"
@@ -36,6 +38,13 @@ void Swapchain::Create(u32 width_, u32 height_, vk::SurfaceKHR surface_, bool lo
     needs_recreation = false;
 
     Destroy();
+
+    // A Wayland surface can report no formats until the compositor has configured it; creating
+    // the swapchain then fails, so retry from the present loop.
+    if (instance.GetPhysicalDevice().getSurfaceFormatsKHR(surface).empty()) {
+        needs_recreation = true;
+        return;
+    }
 
     SetPresentMode();
     if (needs_recreation) {
@@ -79,6 +88,10 @@ void Swapchain::Create(u32 width_, u32 height_, vk::SurfaceKHR surface_, bool lo
         swapchain = instance.GetDevice().createSwapchainKHR(swapchain_info);
     } catch (vk::SurfaceLostKHRError&) {
         LOG_ERROR(Render_Vulkan, "Surface lost during swapchain creation");
+        needs_recreation = true;
+        return;
+    } catch (vk::InitializationFailedError&) {
+        LOG_WARNING(Render_Vulkan, "Swapchain creation failed, retrying");
         needs_recreation = true;
         return;
     } catch (vk::SystemError& err) {
@@ -145,11 +158,19 @@ void Swapchain::Present() {
 }
 
 void Swapchain::FindPresentFormat() {
-    const auto formats = instance.GetPhysicalDevice().getSurfaceFormatsKHR(surface);
+    auto formats = instance.GetPhysicalDevice().getSurfaceFormatsKHR(surface);
+    // A Wayland surface can report no formats until the compositor has configured it.
+    for (int attempt = 0; formats.empty() && attempt < 10; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        formats = instance.GetPhysicalDevice().getSurfaceFormatsKHR(surface);
+    }
+    if (formats.empty()) {
+        LOG_WARNING(Render_Vulkan, "Surface reports no formats, using RGBA");
+    }
 
     // If there is a single undefined surface format, the device doesn't care, so we'll just use
     // RGBA.
-    if (formats[0].format == vk::Format::eUndefined) {
+    if (formats.empty() || formats[0].format == vk::Format::eUndefined) {
         surface_format.format = vk::Format::eR8G8B8A8Unorm;
         surface_format.colorSpace = vk::ColorSpaceKHR::eSrgbNonlinear;
         return;

@@ -26,6 +26,10 @@ public:
     /// Destroys the swapchain and forgets the surface when the native window is going away.
     void OnSurfaceLost();
 
+    bool NeedsRecreation() const {
+        return needs_recreation;
+    }
+
     /// Acquires the next image in the swapchain.
     bool AcquireNextImage();
 

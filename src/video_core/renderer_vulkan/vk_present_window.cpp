@@ -13,6 +13,8 @@
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "vk_platform.h"
 
+#include <algorithm>
+
 #include <vk_mem_alloc.h>
 
 MICROPROFILE_DEFINE(Vulkan_WaitPresent, "Vulkan", "Wait For Present", MP_RGB(128, 128, 128));
@@ -111,7 +113,8 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
       use_present_thread{Settings::values.async_presentation.GetValue()},
       last_render_surface{emu_window.GetWindowInfo().render_surface} {
 
-    const u32 num_images = swapchain.GetImageCount();
+    // The swapchain has no images yet when the surface was not ready at startup.
+    const u32 num_images = std::max(swapchain.GetImageCount(), 3u);
     const vk::Device device = instance.GetDevice();
 
     const vk::CommandPoolCreateInfo pool_info = {
@@ -412,8 +415,15 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
         swapchain.Create(frame->width, frame->height, surface, low_refresh_rate);
     };
 
+    // A dropped frame still has to signal present_done, or GetRenderFrame waits on it forever.
+    const auto drop_frame = [&] {
+        std::scoped_lock submit_lock{scheduler.submit_mutex};
+        graphics_queue.submit({}, frame->present_done);
+    };
+
 #ifndef ANDROID
     if (!surface_ok) {
+        drop_frame();
         return;
     }
     if (swapchain_dirty) [[unlikely]] {
@@ -433,6 +443,12 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
 
     while (!swapchain.AcquireNextImage()) {
         recreate_swapchain();
+        if (swapchain.NeedsRecreation()) {
+            // The surface is not ready yet. Drop this frame and release swapchain_mutex: the
+            // window system thread needs it to deliver the surface notifications.
+            drop_frame();
+            return;
+        }
     }
 
     const vk::Image swapchain_image = swapchain.Image();
