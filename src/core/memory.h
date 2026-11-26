@@ -778,8 +778,6 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl;
 
-    PhysMemRegionInfo phys_mem_region_info_cache{};
-
     friend class boost::serialization::access;
     template <class Archive>
     void serialize(Archive& ar, const unsigned int file_version);
