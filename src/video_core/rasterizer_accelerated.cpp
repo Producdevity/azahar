@@ -112,6 +112,12 @@ RasterizerAccelerated::VertexArrayInfo RasterizerAccelerated::AnalyzeVertexArray
         const u32 count = regs.pipeline.num_vertices;
         const u32 index_size = index_u16 ? 2 : 1;
         const u32 size = count * index_size;
+        const std::size_t available = memory.GetPhysicalRef(address).GetSize();
+        if (u64{count} * index_size > available) {
+            LOG_ERROR(Render, "Index buffer {:#010X} with {} indices exceeds available space {}",
+                      address, count, available);
+            return {0, 0, 0};
+        }
         FlushRegion(address, size);
 
         if (index_u16) {
